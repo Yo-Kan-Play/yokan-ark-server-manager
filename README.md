@@ -90,6 +90,11 @@ cp bot/config.example.yml bot/config.yaml
 3) `bot/config.yaml` の `podman.socket_path` を実行環境に合わせます。
    例: `/run/user/1000/podman/podman.sock`
 
+  併せて次も確認してください。
+  - `podman.persist_container_path`: Botコンテナ内から見える persist のパス
+  - `server_defaults.rcon_host`: コンテナ運用では `host.containers.internal` を推奨
+  - 開発時に反映を速くしたい場合は `discord.command_guild_id` にテスト用 Guild ID を設定
+
 4) Bot コンテナを起動します。
 
 ```bash
@@ -101,6 +106,7 @@ podman run --rm --name yokan-ark-bot \
   -e R2_SECRET_ACCESS_KEY=xxxxxxxx \
   -v "$PWD/bot/config.yaml:/config/config.yaml:ro" \
   -v "/run/user/$(id -u)/podman/podman.sock:/run/user/$(id -u)/podman/podman.sock" \
+  -v "/srv/yokan-ark/persist:/srv/yokan-ark/persist:ro" \
   -v "/srv/yokan-ark/backups/local:/srv/yokan-ark/backups/local:rw" \
   yokan-ark-bot:latest
 ```

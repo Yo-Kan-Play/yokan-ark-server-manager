@@ -4,6 +4,7 @@ import (
 	"archive/tar"
 	"compress/gzip"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"io/fs"
@@ -23,6 +24,11 @@ type BackupManager struct {
 	cfg *Config
 	pod *PodmanClient
 }
+
+var (
+	ErrBackupSkipped        = errors.New("backup skipped")
+	ErrLatestLocalNotFound  = errors.New("latest local backup not found")
+)
 
 func NewBackupManager(cfg *Config, pod *PodmanClient) *BackupManager {
 	return &BackupManager{cfg: cfg, pod: pod}
@@ -67,7 +73,7 @@ func (b *BackupManager) saveDir(m MapConfig) string {
 func (b *BackupManager) LocalBackup(ctx context.Context, m MapConfig) (string, int64, error) {
 	_ = ctx
 	if !b.cfg.Backup.Local.Enabled || !mapBackupEnabled(m) {
-		return "", 0, nil
+		return "", 0, ErrBackupSkipped
 	}
 	baseDir := filepath.Join(b.cfg.Backup.Local.OutDir, m.MapID)
 	if err := os.MkdirAll(baseDir, 0o755); err != nil {
@@ -212,11 +218,14 @@ func (b *BackupManager) cloudClient(ctx context.Context) (*s3.Client, error) {
 
 func (b *BackupManager) UploadLatestToCloud(ctx context.Context, m MapConfig) (string, int64, error) {
 	if !b.cfg.Backup.Cloud.Enabled || !mapBackupEnabled(m) {
-		return "", 0, nil
+		return "", 0, ErrBackupSkipped
 	}
 	latestPath, size, err := b.latestLocalBackup(m)
-	if err != nil || latestPath == "" {
+	if err != nil {
 		return "", size, err
+	}
+	if latestPath == "" {
+		return "", 0, ErrLatestLocalNotFound
 	}
 	client, err := b.cloudClient(ctx)
 	if err != nil {

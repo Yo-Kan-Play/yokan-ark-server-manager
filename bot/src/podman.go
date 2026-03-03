@@ -124,6 +124,10 @@ func (p *PodmanClient) CreateContainer(ctx context.Context, m MapConfig) error {
 	name := containerName(p.cfg, m.MapID)
 	rconPort := m.Port + p.cfg.Server.RCONPortOffset
 	queryPort := m.Port + p.cfg.Server.QueryPortOffset
+	memoryLimitGB := p.cfg.Server.MemoryLimitGB
+	if m.MemoryLimitGB != nil {
+		memoryLimitGB = *m.MemoryLimitGB
+	}
 	publishQuery := p.cfg.Podman.CreateDefaults.PublishQueryPort
 	if m.PublishQueryPort != nil {
 		publishQuery = *m.PublishQueryPort
@@ -139,6 +143,7 @@ func (p *PodmanClient) CreateContainer(ctx context.Context, m MapConfig) error {
 
 	hostCfg := map[string]any{
 		"Binds": []string{p.cfg.Podman.PersistHostPath + ":/persist:rw"},
+		"Memory": int64(memoryLimitGB) * 1024 * 1024 * 1024,
 		"PortBindings": map[string][]map[string]string{
 			fmt.Sprintf("%d/udp", m.Port): {{"HostPort": strconv.Itoa(m.Port)}},
 			fmt.Sprintf("%d/tcp", rconPort): {{"HostPort": strconv.Itoa(rconPort)}},
@@ -297,5 +302,5 @@ func (p *PodmanClient) CollectStatuses(ctx context.Context, maps []MapConfig) ([
 }
 
 func (p *PodmanClient) DefaultSaveDir(mapID string) string {
-	return filepath.Join(p.cfg.Podman.PersistHostPath, "maps", mapID, "server-files", "ShooterGame", "Saved")
+	return filepath.Join(p.cfg.Podman.PersistContainerPath, "maps", mapID, "server-files", "ShooterGame", "Saved")
 }

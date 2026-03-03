@@ -25,6 +25,7 @@ type Config struct {
 type DiscordConfig struct {
 	CommandChannelIDs []string `yaml:"command_channel_ids"`
 	NotifyChannelID   string   `yaml:"notify_channel_id"`
+	CommandGuildID    string   `yaml:"command_guild_id"`
 }
 
 type PermissionsConfig struct {
@@ -51,6 +52,7 @@ type PodmanConfig struct {
 	SocketPath          string `yaml:"socket_path"`
 	ServerImage         string `yaml:"server_image"`
 	PersistHostPath     string `yaml:"persist_host_path"`
+	PersistContainerPath string `yaml:"persist_container_path"`
 	ContainerNamePrefix string `yaml:"container_name_prefix"`
 	CreateDefaults      struct {
 		TimezoneMount     bool `yaml:"timezone_mount"`
@@ -61,6 +63,7 @@ type PodmanConfig struct {
 type ServerDefaults struct {
 	MaxPlayers      int    `yaml:"max_players"`
 	ClusterID       string `yaml:"cluster_id"`
+	MemoryLimitGB   int    `yaml:"memory_limit_gb"`
 	RCONPasswordEnv string `yaml:"rcon_password_env"`
 	RCONHost        string `yaml:"rcon_host"`
 	RCONPortOffset  int    `yaml:"rcon_port_offset"`
@@ -114,6 +117,7 @@ type MapConfig struct {
 	DisplayName      string `yaml:"display_name"`
 	SessionName      string `yaml:"session_name"`
 	Port             int    `yaml:"port"`
+	MemoryLimitGB    *int   `yaml:"memory_limit_gb"`
 	BackupEnabled    *bool  `yaml:"backup_enabled"`
 	SaveDirOverride  string `yaml:"save_dir_override"`
 	PublishQueryPort *bool  `yaml:"publish_query_port"`
@@ -160,17 +164,23 @@ func applyDefaults(cfg *Config) {
 	if cfg.Podman.ContainerNamePrefix == "" {
 		cfg.Podman.ContainerNamePrefix = "yokan-ark-"
 	}
+	if cfg.Podman.PersistContainerPath == "" {
+		cfg.Podman.PersistContainerPath = cfg.Podman.PersistHostPath
+	}
 	if cfg.Server.MaxPlayers <= 0 {
 		cfg.Server.MaxPlayers = 10
 	}
 	if cfg.Server.ClusterID == "" {
 		cfg.Server.ClusterID = "yokan-ark"
 	}
+	if cfg.Server.MemoryLimitGB <= 0 {
+		cfg.Server.MemoryLimitGB = 20
+	}
 	if cfg.Server.RCONPasswordEnv == "" {
 		cfg.Server.RCONPasswordEnv = "ARK_RCON_PASSWORD"
 	}
 	if cfg.Server.RCONHost == "" {
-		cfg.Server.RCONHost = "127.0.0.1"
+		cfg.Server.RCONHost = "host.containers.internal"
 	}
 	if cfg.Server.RCONPortOffset == 0 {
 		cfg.Server.RCONPortOffset = 19243

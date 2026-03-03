@@ -24,13 +24,13 @@ type Bot struct {
 	backup   *BackupManager
 	mapByID  map[string]MapConfig
 
-	mu             sync.Mutex
-	mapLocks       map[string]*sync.Mutex
-	zeroSince      map[string]time.Time
-	startedAt      map[string]time.Time
+	mu              sync.Mutex
+	mapLocks        map[string]*sync.Mutex
+	zeroSince       map[string]time.Time
+	startedAt       map[string]time.Time
 	nextLocalBackup map[string]time.Time
 	lastScheduleRun map[string]time.Time
-	scanQueue      chan string
+	scanQueue       chan string
 }
 
 func NewBot(cfg *Config, logger *ActionLogger) (*Bot, error) {
@@ -94,6 +94,7 @@ func (b *Bot) Run(ctx context.Context) error {
 	if err := b.registerCommands(); err != nil {
 		return err
 	}
+	b.restoreRuntimeState(ctx)
 	b.log.Info("Discord Bot 起動完了")
 	go b.runScanWorker(ctx)
 	go b.runSchedulers(ctx)
@@ -135,7 +136,8 @@ func (b *Bot) registerCommands() error {
 			{Type: discordgo.ApplicationCommandOptionSubCommand, Name: "broadcast", Description: "全起動マップへ送信", Options: []*discordgo.ApplicationCommandOption{{Type: discordgo.ApplicationCommandOptionString, Name: "msg", Description: "メッセージ", Required: true}}},
 		},
 	}
-	_, err := b.dg.ApplicationCommandCreate(b.dg.State.User.ID, "", cmd)
+	guildID := strings.TrimSpace(b.cfg.Discord.CommandGuildID)
+	_, err := b.dg.ApplicationCommandCreate(b.dg.State.User.ID, guildID, cmd)
 	return err
 }
 
@@ -193,6 +195,9 @@ func (b *Bot) onInteractionCreate(s *discordgo.Session, i *discordgo.Interaction
 		b.reply(i, "このコマンドを実行する権限がありません")
 		return
 	}
+	if !b.deferReply(i) {
+		return
+	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 	defer cancel()
@@ -226,10 +231,51 @@ func (b *Bot) onInteractionCreate(s *discordgo.Session, i *discordgo.Interaction
 		message = "未対応コマンドです"
 	}
 	if err != nil {
-		b.reply(i, message+"\nエラー: "+err.Error())
+		b.editReply(i, message+"\nエラー: "+err.Error())
 		return
 	}
-	b.reply(i, message)
+	b.editReply(i, message)
+}
+
+func (b *Bot) deferReply(i *discordgo.InteractionCreate) bool {
+	err := b.dg.InteractionRespond(i.Interaction, &discordgo.InteractionResponse{
+		Type: discordgo.InteractionResponseDeferredChannelMessageWithSource,
+	})
+	if err == nil {
+		return true
+	}
+	b.log.Warn("defer応答失敗: %v", err)
+	return false
+}
+
+func (b *Bot) editReply(i *discordgo.InteractionCreate, msg string) {
+	_, err := b.dg.InteractionResponseEdit(i.Interaction, &discordgo.WebhookEdit{Content: &msg})
+	if err != nil {
+		b.log.Warn("応答編集失敗: %v", err)
+	}
+}
+
+func (b *Bot) listPlayersLocked(ctx context.Context, m MapConfig) ([]string, error) {
+	lock := b.mapLock(m.MapID)
+	lock.Lock()
+	defer lock.Unlock()
+	return b.rcon.ListPlayers(ctx, m)
+}
+
+func (b *Bot) broadcastLocked(ctx context.Context, m MapConfig, msg string) error {
+	lock := b.mapLock(m.MapID)
+	lock.Lock()
+	defer lock.Unlock()
+	return b.rcon.Broadcast(ctx, m, msg)
+}
+
+func (b *Bot) enqueueScan(reason string) bool {
+	select {
+	case b.scanQueue <- reason:
+		return true
+	default:
+		return false
+	}
 }
 
 func (b *Bot) reply(i *discordgo.InteractionCreate, msg string) {
@@ -381,6 +427,7 @@ func (b *Bot) cmdBackup(ctx context.Context) (string, error) {
 	status, _ := b.podman.CollectStatuses(ctx, b.cfg.Maps)
 	failed := []string{}
 	success := []string{}
+	skipped := []string{}
 	for _, st := range status {
 		if !st.Running {
 			continue
@@ -391,30 +438,44 @@ func (b *Bot) cmdBackup(ctx context.Context) (string, error) {
 		time.Sleep(time.Duration(b.cfg.Runtime.SaveWaitSeconds) * time.Second)
 		_, _, errBackup := b.backup.LocalBackup(ctx, st.Map)
 		lock.Unlock()
-		if errSave != nil || errBackup != nil {
+		if errSave != nil {
+			failed = append(failed, st.Map.MapID)
+			continue
+		}
+		if errors.Is(errBackup, ErrBackupSkipped) {
+			skipped = append(skipped, st.Map.MapID)
+			continue
+		}
+		if errBackup != nil {
 			failed = append(failed, st.Map.MapID)
 			continue
 		}
 		success = append(success, st.Map.MapID)
 	}
-	if len(success) == 0 && len(failed) == 0 {
+	if len(success) == 0 && len(failed) == 0 && len(skipped) == 0 {
 		return "起動中マップがありません", nil
 	}
 	if len(failed) > 0 {
 		b.notify("ローカルバックアップ失敗: " + strings.Join(failed, ","))
-		return fmt.Sprintf("バックアップ結果 成功:%s 失敗:%s", strings.Join(success, ","), strings.Join(failed, ",")), nil
 	}
-	b.notify("ローカルバックアップ成功: " + strings.Join(success, ","))
-	return fmt.Sprintf("起動中マップをバックアップしました（対象: %d）", len(success)), nil
+	if len(success) > 0 {
+		b.notify("ローカルバックアップ成功: " + strings.Join(success, ","))
+	}
+	if len(skipped) > 0 {
+		b.notify("ローカルバックアップスキップ: " + strings.Join(skipped, ","))
+	}
+	return fmt.Sprintf("バックアップ結果 成功:%s 失敗:%s スキップ:%s",
+		strings.Join(success, ","),
+		strings.Join(failed, ","),
+		strings.Join(skipped, ",")), nil
 }
 
 func (b *Bot) cmdScan(ctx context.Context) (string, error) {
-	select {
-	case b.scanQueue <- "manual":
-	default:
+	_ = ctx
+	if b.enqueueScan("manual") {
+		return "無人監視スキャンをキュー投入しました", nil
 	}
-	_ = b.scanIdleOnce(ctx, "manual")
-	return "無人監視スキャンを実行しました", nil
+	return "無人監視スキャンはすでに実行待ちです（重複投入をスキップしました）", nil
 }
 
 func (b *Bot) cmdPlayers(ctx context.Context, mapID string) (string, error) {
@@ -438,7 +499,7 @@ func (b *Bot) cmdPlayers(ctx context.Context, mapID string) (string, error) {
 	}
 	lines := []string{}
 	for _, m := range maps {
-		players, err := b.rcon.ListPlayers(ctx, m)
+		players, err := b.listPlayersLocked(ctx, m)
 		if err != nil {
 			lines = append(lines, fmt.Sprintf("- %s: 取得失敗", m.DisplayName))
 			continue
@@ -481,10 +542,7 @@ func (b *Bot) cmdBroadcast(ctx context.Context, msg string) (string, error) {
 	}
 	failed := []string{}
 	for _, m := range targets {
-		lock := b.mapLock(m.MapID)
-		lock.Lock()
-		err := b.rcon.Broadcast(ctx, m, msg)
-		lock.Unlock()
+		err := b.broadcastLocked(ctx, m, msg)
 		if err != nil {
 			failed = append(failed, m.MapID)
 		}
@@ -507,7 +565,7 @@ func (b *Bot) cmdStatus(ctx context.Context) (string, error) {
 			continue
 		}
 		running++
-		players, _ := b.rcon.ListPlayers(ctx, st.Map)
+		players, _ := b.listPlayersLocked(ctx, st.Map)
 		saveSize, _ := dirSize(b.backup.saveDir(st.Map))
 		_, localSize, _ := b.backup.latestLocalBackup(st.Map)
 		cloudSize, _ := b.backup.LatestCloudSize(ctx, st.Map)
@@ -542,8 +600,8 @@ func (b *Bot) runScanWorker(ctx context.Context) {
 		select {
 		case <-ctx.Done():
 			return
-		case <-b.scanQueue:
-			_ = b.scanIdleOnce(context.Background(), "queued")
+		case reason := <-b.scanQueue:
+			_ = b.scanIdleOnce(context.Background(), reason)
 		}
 	}
 }
@@ -607,10 +665,7 @@ func (b *Bot) runSchedulers(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case <-scanTicker.C:
-			select {
-			case b.scanQueue <- "interval":
-			default:
-			}
+			_ = b.enqueueScan("interval")
 		case <-presenceTicker.C:
 			_ = b.updatePresence(ctx)
 		case <-minuteTicker.C:
@@ -628,7 +683,7 @@ func (b *Bot) updatePresence(ctx context.Context) error {
 			continue
 		}
 		running++
-		list, err := b.rcon.ListPlayers(ctx, st.Map)
+		list, err := b.listPlayersLocked(ctx, st.Map)
 		if err == nil {
 			players += len(list)
 		}
@@ -660,7 +715,7 @@ func (b *Bot) runLocalBackupScheduler(ctx context.Context, now time.Time) {
 		b.mu.Lock()
 		next := b.nextLocalBackup[st.Map.MapID]
 		if next.IsZero() {
-			next = now.Add(time.Duration(b.cfg.Backup.Local.IntervalMinutes) * time.Minute)
+			next = b.nextBackupFromStartLocked(st.Map.MapID, now)
 			b.nextLocalBackup[st.Map.MapID] = next
 		}
 		b.mu.Unlock()
@@ -669,15 +724,21 @@ func (b *Bot) runLocalBackupScheduler(ctx context.Context, now time.Time) {
 		}
 		lock := b.mapLock(st.Map.MapID)
 		lock.Lock()
-		_, _, err := b.backup.LocalBackup(ctx, st.Map)
+		errSave := b.rcon.SaveWorld(ctx, st.Map)
+		time.Sleep(time.Duration(b.cfg.Runtime.SaveWaitSeconds) * time.Second)
+		_, _, errBackup := b.backup.LocalBackup(ctx, st.Map)
 		lock.Unlock()
-		if err != nil {
+		if errSave != nil {
+			b.notify("ローカルバックアップ失敗: " + st.Map.DisplayName + " (saveworld失敗)")
+		} else if errors.Is(errBackup, ErrBackupSkipped) {
+			b.notify("ローカルバックアップスキップ: " + st.Map.DisplayName)
+		} else if errBackup != nil {
 			b.notify("ローカルバックアップ失敗: " + st.Map.DisplayName)
 		} else {
-			b.notify("ローカルバックアップ完了: " + st.Map.DisplayName)
+			b.notify("ローカルバックアップ成功: " + st.Map.DisplayName)
 		}
 		b.mu.Lock()
-		b.nextLocalBackup[st.Map.MapID] = now.Add(time.Duration(b.cfg.Backup.Local.IntervalMinutes) * time.Minute)
+		b.nextLocalBackup[st.Map.MapID] = b.nextBackupFromStartLocked(st.Map.MapID, now)
 		b.mu.Unlock()
 	}
 }
@@ -699,11 +760,17 @@ func (b *Bot) runCloudBackupScheduler(ctx context.Context, now time.Time) {
 	}
 	fails := []string{}
 	oks := []string{}
+	skips := []string{}
 	for _, m := range b.cfg.Maps {
 		if !mapBackupEnabled(m) {
+			skips = append(skips, m.MapID)
 			continue
 		}
 		if _, _, err := b.backup.UploadLatestToCloud(ctx, m); err != nil {
+			if errors.Is(err, ErrBackupSkipped) || errors.Is(err, ErrLatestLocalNotFound) {
+				skips = append(skips, m.MapID)
+				continue
+			}
 			fails = append(fails, m.MapID)
 		} else {
 			oks = append(oks, m.MapID)
@@ -713,7 +780,10 @@ func (b *Bot) runCloudBackupScheduler(ctx context.Context, now time.Time) {
 		b.notify("クラウドバックアップ失敗: " + strings.Join(fails, ","))
 	}
 	if len(oks) > 0 {
-		b.notify("クラウドバックアップ完了: " + strings.Join(oks, ","))
+		b.notify("クラウドバックアップ成功: " + strings.Join(oks, ","))
+	}
+	if len(skips) > 0 {
+		b.notify("クラウドバックアップスキップ: " + strings.Join(skips, ","))
 	}
 	b.mu.Lock()
 	b.lastScheduleRun[key] = now
@@ -742,7 +812,7 @@ func (b *Bot) runAnnouncementScheduler(ctx context.Context, now time.Time) {
 		targetMaps := b.runningMapsFiltered(ctx, item.IncludeMaps)
 		failed := []string{}
 		for _, m := range targetMaps {
-			if err := b.rcon.Broadcast(ctx, m, item.Message); err != nil {
+			if err := b.broadcastLocked(ctx, m, item.Message); err != nil {
 				failed = append(failed, m.MapID)
 			}
 		}
@@ -817,6 +887,56 @@ func (b *Bot) gracefulStopAll(ctx context.Context, reason string) error {
 		return fmt.Errorf("%s 失敗: %s", reason, strings.Join(failed, ","))
 	}
 	return nil
+}
+
+func (b *Bot) restoreRuntimeState(ctx context.Context) {
+	status, err := b.podman.CollectStatuses(ctx, b.cfg.Maps)
+	if err != nil {
+		b.log.Warn("起動時状態復元の収集中エラー: %v", err)
+	}
+	now := time.Now()
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	for _, st := range status {
+		if !st.Running {
+			continue
+		}
+		ins, ierr := b.podman.InspectState(ctx, st.Map.MapID)
+		if ierr != nil {
+			b.log.Warn("起動時状態復元 inspect失敗: map=%s err=%v", st.Map.MapID, ierr)
+			continue
+		}
+		started := ins.StartedAt
+		if started.IsZero() {
+			started = now
+		}
+		b.startedAt[st.Map.MapID] = started
+		if b.cfg.Backup.Local.Enabled {
+			b.nextLocalBackup[st.Map.MapID] = b.nextBackupFromStartNoLock(started, now)
+		}
+	}
+}
+
+func (b *Bot) nextBackupFromStartNoLock(started, now time.Time) time.Time {
+	interval := time.Duration(b.cfg.Backup.Local.IntervalMinutes) * time.Minute
+	if interval <= 0 {
+		interval = 120 * time.Minute
+	}
+	if now.Before(started) || now.Equal(started) {
+		return started.Add(interval)
+	}
+	passed := now.Sub(started)
+	steps := int64(passed / interval)
+	return started.Add(time.Duration(steps+1) * interval)
+}
+
+func (b *Bot) nextBackupFromStartLocked(mapID string, now time.Time) time.Time {
+	started := b.startedAt[mapID]
+	if started.IsZero() {
+		started = now
+		b.startedAt[mapID] = started
+	}
+	return b.nextBackupFromStartNoLock(started, now)
 }
 
 func (b *Bot) sortedMapStates(ctx context.Context) ([]MapStatus, error) {

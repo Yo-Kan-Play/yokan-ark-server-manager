@@ -11,6 +11,10 @@ discord:
   # Bot sends notifications (start/stop/backup/errors) to this channel.
   notify_channel_id: 234567890123456789
 
+  # Optional (development): register slash commands to a specific guild for fast reflection.
+  # Empty means global registration.
+  command_guild_id: ""
+
 # --- Permissions ---
 permissions:
   # Fallback rules (used when command-specific allow_user_ids is not provided)
@@ -63,6 +67,10 @@ podman:
   # Host path for persistence (single mount). Bot uses this to create directories.
   persist_host_path: /srv/yokan-ark/persist
 
+  # Persist path visible from inside bot container.
+  # If you mount host persist to different container path (e.g. /persist), set it here.
+  persist_container_path: /srv/yokan-ark/persist
+
   container_name_prefix: yokan-ark-
 
   create_defaults:
@@ -73,8 +81,9 @@ podman:
 server_defaults:
   cluster_id: yokan-ark
   max_players: 10
+  memory_limit_gb: 20
   rcon_password_env: ARK_RCON_PASSWORD
-  rcon_host: 127.0.0.1
+  rcon_host: host.containers.internal
   rcon_port_offset: 19243
   query_port_offset: 1
 
@@ -142,6 +151,8 @@ maps:
     display_name: The Center
     session_name: Yokan Ark The Center
     port: 7777
+    # Optional per-map override (GB)
+    # memory_limit_gb: 24
     backup_enabled: true
     publish_query_port: true
 
